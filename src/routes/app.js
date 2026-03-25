@@ -171,7 +171,6 @@ app.get('/exchange-rates', async (req, res) => {
         supportedCurrencies: ['XLM', ...priceOracle.SUPPORTED_CURRENCIES.map(c => c.toUpperCase())],
         cachedAt: new Date().toISOString(),
       }
-      },
     });
   } catch (err) {
     log.error('APP', 'Failed to fetch exchange rates', { error: err.message });

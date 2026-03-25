@@ -21,7 +21,8 @@ const CREATE_TABLE_SQL = `
     grace_period_days INTEGER NOT NULL DEFAULT 30,
     rotated_to_id INTEGER,
     signing_required INTEGER NOT NULL DEFAULT 0,
-    key_secret TEXT
+    key_secret TEXT,
+    scopes TEXT
   )
 `;
 
@@ -29,7 +30,7 @@ async function initializeApiKeysTable() {
   await db.run(CREATE_TABLE_SQL);
 }
 
-async function createApiKey({ name, role = 'user', expiresInDays, createdBy, metadata = {}, gracePeriodDays = 30, signingRequired = false }) {
+async function createApiKey({ name, role = 'user', expiresInDays, createdBy, metadata = {}, gracePeriodDays = 30, signingRequired = false, scopes = [] }) {
   await initializeApiKeysTable();
   const rawKey = crypto.randomBytes(32).toString('hex');
   const keyHash = crypto.createHash('sha256').update(rawKey).digest('hex');
@@ -40,9 +41,9 @@ async function createApiKey({ name, role = 'user', expiresInDays, createdBy, met
   const expiresAt = expiresInDays ? now + expiresInDays * 24 * 60 * 60 * 1000 : null;
 
   const result = await db.run(
-    `INSERT INTO api_keys (key_hash, key_prefix, name, role, status, created_by, metadata, expires_at, created_at, grace_period_days, signing_required, key_secret)
-     VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
-    [keyHash, keyPrefix, name, role, createdBy || null, JSON.stringify(metadata), expiresAt, now, gracePeriodDays, signingRequired ? 1 : 0, keySecret]
+    `INSERT INTO api_keys (key_hash, key_prefix, name, role, status, created_by, metadata, expires_at, created_at, grace_period_days, signing_required, key_secret, scopes)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [keyHash, keyPrefix, name, role, createdBy || null, JSON.stringify(metadata), expiresAt, now, gracePeriodDays, signingRequired ? 1 : 0, keySecret, JSON.stringify(scopes)]
   );
 
   return {
@@ -52,6 +53,7 @@ async function createApiKey({ name, role = 'user', expiresInDays, createdBy, met
     keyPrefix,
     name,
     role,
+    scopes,
     status: API_KEY_STATUS.ACTIVE,
     createdAt: new Date(now).toISOString(),
     expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
@@ -82,6 +84,7 @@ async function validateApiKey(rawKey) {
     keyPrefix: row.key_prefix,
     name: row.name,
     role: row.role,
+    scopes: row.scopes ? JSON.parse(row.scopes) : [],
     status: row.status,
     isDeprecated: row.status === API_KEY_STATUS.DEPRECATED,
     last_used_at: now,
@@ -110,6 +113,7 @@ async function listApiKeys(filters = {}) {
     keyPrefix: row.key_prefix,
     name: row.name,
     role: row.role,
+    scopes: row.scopes ? JSON.parse(row.scopes) : [],
     status: row.status,
     isDeprecated: row.status === API_KEY_STATUS.DEPRECATED,
     last_used_at: row.last_used_at,
@@ -140,11 +144,15 @@ async function revokeApiKey(id) {
 
 async function updateApiKey(id, updates = {}) {
   await initializeApiKeysTable();
-  const allowed = ['name', 'role', 'metadata', 'signing_required'];
+  const allowed = ['name', 'role', 'metadata', 'signing_required', 'scopes'];
   const fields = Object.keys(updates).filter(k => allowed.includes(k));
   if (fields.length === 0) return false;
   const sets = fields.map(f => `${f} = ?`).join(', ');
-  const values = fields.map(f => f === 'metadata' ? JSON.stringify(updates[f]) : updates[f]);
+  const values = fields.map(f => {
+    if (f === 'metadata') return JSON.stringify(updates[f]);
+    if (f === 'scopes') return JSON.stringify(updates[f]);
+    return updates[f];
+  });
   const result = await db.run(`UPDATE api_keys SET ${sets} WHERE id = ?`, [...values, id]);
   return result.changes > 0;
 }
@@ -176,6 +184,7 @@ async function rotateApiKey(oldKeyId, { gracePeriodDays = 30 } = {}) {
     role: oldRow.role,
     createdBy: oldRow.created_by,
     metadata: oldRow.metadata ? JSON.parse(oldRow.metadata) : {},
+    scopes: oldRow.scopes ? JSON.parse(oldRow.scopes) : [],
     gracePeriodDays,
   });
 
