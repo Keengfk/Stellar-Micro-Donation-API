@@ -24,6 +24,7 @@ const { checkConfirmations } = require('../utils/confirmationChecker');
 const { CONFIRMATION_LEDGER_THRESHOLD } = require('../config/confirmationThreshold');
 
 const LimitService = require('./LimitService');
+const MatchingProgramService = require('./MatchingProgramService');
 const log = require('../utils/log');
 const priceOracle = require('./PriceOracleService');
 const { buildOverpaymentRecord } = require('../utils/overpaymentDetector');
@@ -164,6 +165,18 @@ class DonationService {
       });
     }
 
+    // Process donation matching programs (non-blocking)
+    let matchingDonations = [];
+    try {
+      matchingDonations = await MatchingProgramService.processMatchingDonation({
+        id: dbResult.id,
+        amount: parseFloat(amount),
+        campaign_id: campaign_id || null
+      });
+    } catch (err) {
+      log.error('DONATION_SERVICE', 'Failed to process donation matching', { error: err.message });
+    }
+
     // Record in JSON with state transitions
     const transaction = Transaction.create({
       id: dbResult.id.toString(),
@@ -232,7 +245,8 @@ class DonationService {
       confirmations: confirmationResult.confirmations,
       confirmationThreshold: confirmationResult.required,
       confirmed: confirmationResult.confirmed,
-      remainingLimits: { dailyRemaining, monthlyRemaining }
+      remainingLimits: { dailyRemaining, monthlyRemaining },
+      ...(matchingDonations.length > 0 && { matchingDonations })
     };
   }
 
@@ -674,6 +688,20 @@ class DonationService {
       await this.processCampaignContribution(campaign_id, xlmAmount).catch(err => {
         log.error('DONATION_SERVICE', 'Failed to update campaign contribution', { error: err.message });
       });
+    }
+
+    // Process donation matching programs (non-blocking)
+    try {
+      const matchingResults = await MatchingProgramService.processMatchingDonation({
+        id: transaction.id,
+        amount: xlmAmount,
+        campaign_id: campaign_id || null
+      });
+      if (matchingResults.length > 0) {
+        transaction.matchingDonations = matchingResults;
+      }
+    } catch (err) {
+      log.error('DONATION_SERVICE', 'Failed to process donation matching', { error: err.message });
     }
 
     // Detect memo collision after the record is created so we have a transactionId
