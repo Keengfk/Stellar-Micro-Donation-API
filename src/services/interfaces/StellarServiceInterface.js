@@ -121,17 +121,6 @@ class StellarServiceInterface {
     throw new Error('getInflationDestination() must be implemented');
   }
 
-  async setHomeDomain(_sourceSecret, _domain) {
-    void _sourceSecret;
-    void _domain;
-    throw new Error('setHomeDomain() must be implemented');
-  }
-
-  async getHomeDomain(_publicKey) {
-    void _publicKey;
-    throw new Error('getHomeDomain() must be implemented');
-  }
-
   async setAccountData(_secret, _key, _value) {
     void _secret;
     void _key;
@@ -145,17 +134,30 @@ class StellarServiceInterface {
     throw new Error('deleteAccountData() must be implemented');
   }
 
-  async mintCertificateNFT(_params) {
-    void _params;
-    throw new Error('mintCertificateNFT() must be implemented');
+  /**
+   * Set account options (home domain, thresholds, signers, flags).
+   * @param {string} _secret - Account secret key
+   * @param {object} _options - Stellar setOptions fields
+   */
+  async setOptions(_secret, _options) {
+    void _secret;
+    void _options;
+    throw new Error('setOptions() must be implemented');
   }
 
-  async getCertificatesForWallet(_publicKey) {
-    void _publicKey;
-    throw new Error('getCertificatesForWallet() must be implemented');
-  async simulateTransaction(_xdr) {
-    void _xdr;
-    throw new Error('simulateTransaction() must be implemented');
+  /**
+   * Clawback a custom asset from a holder.
+   * @param {string} _issuerSecret - Issuer secret key
+   * @param {string} _from         - Holder public key
+   * @param {string} _assetCode    - Asset code
+   * @param {string} _amount       - Amount to clawback
+   */
+  async clawback(_issuerSecret, _from, _assetCode, _amount) {
+    void _issuerSecret;
+    void _from;
+    void _assetCode;
+    void _amount;
+    throw new Error('clawback() must be implemented');
   }
 }
 

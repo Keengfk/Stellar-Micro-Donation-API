@@ -1541,89 +1541,46 @@ router.get('/:id/impact', checkPermission(PERMISSIONS.DONATIONS_READ), donationI
   }
 });
 
+// ─── IPFS Certificate ─────────────────────────────────────────────────────────
+
+const { pinCertificate, GATEWAY_URL } = require('../utils/ipfs');
+const Database = require('../utils/database');
+
 /**
- * POST /donations/:id/verify-memo
- * Verify that a document's SHA-256 hash matches the hash memo stored on a donation.
- *
- * Accepts either:
- *   - { document: <hex or base64 string of raw bytes> } — hashes the decoded bytes
- *   - { hash: <hex or base64 encoded 32-byte hash> }    — compares directly
- *
- * Returns { verified: boolean, donationId, memoHash, providedHash }
+ * GET /donations/:id/certificate/ipfs
+ * Returns the IPFS gateway URL for a donation's impact certificate.
+ * If no CID is stored yet, pins the certificate on demand.
  */
-router.post('/:id/verify-memo', checkPermission(PERMISSIONS.DONATIONS_READ), donationIdParamSchema, (req, res, next) => {
+router.get('/:id/certificate/ipfs', checkPermission(PERMISSIONS.DONATIONS_READ), donationIdParamSchema, async (req, res, next) => {
   try {
-    const transaction = Transaction.getById(req.params.id);
+    const donationId = parseInt(req.params.id, 10);
+    const tx = await Database.get('SELECT * FROM transactions WHERE id = ?', [donationId]);
+    if (!tx) {
+      const { NotFoundError } = require('../utils/errors');
+      throw new NotFoundError(`Donation ${donationId} not found`);
+    }
 
-    if (!transaction) {
-      return res.status(404).json({
-        success: false,
-        error: { code: 'NOT_FOUND', message: `Donation ${req.params.id} not found` },
+    let cid = tx.ipfs_cid;
+    let pinned = !!cid;
+
+    if (!cid) {
+      // Pin on demand
+      const result = await pinCertificate({
+        id: tx.id,
+        senderPublicKey: tx.senderPublicKey || String(tx.senderId),
+        receiverPublicKey: tx.receiverPublicKey || String(tx.receiverId),
+        amount: tx.amount,
+        memo: tx.memo,
+        timestamp: tx.timestamp,
       });
+      cid = result.cid;
+      pinned = result.pinned;
+      await Database.run('UPDATE transactions SET ipfs_cid = ? WHERE id = ?', [cid, donationId]);
     }
-
-    if (!transaction.memoHash || transaction.memoType !== 'hash') {
-      return res.status(422).json({
-        success: false,
-        error: { code: 'NO_HASH_MEMO', message: 'This donation does not have a hash memo' },
-      });
-    }
-
-    const { document, hash } = req.body;
-
-    if (!document && !hash) {
-      return res.status(400).json({
-        success: false,
-        error: { code: 'MISSING_INPUT', message: 'Provide either "document" (raw bytes as hex/base64) or "hash" (32-byte hash as hex/base64)' },
-      });
-    }
-
-    let providedHashHex;
-
-    if (hash) {
-      // Direct hash comparison
-      const h = String(hash).trim();
-      if (/^[0-9a-fA-F]{64}$/.test(h)) {
-        providedHashHex = h.toLowerCase();
-      } else if (/^[A-Za-z0-9+/]{43}=$/.test(h)) {
-        providedHashHex = Buffer.from(h, 'base64').toString('hex');
-      } else {
-        return res.status(400).json({
-          success: false,
-          error: { code: 'INVALID_HASH', message: 'hash must be exactly 32 bytes as hex (64 chars) or base64 (44 chars)' },
-        });
-      }
-    } else {
-      // Hash the document
-      const crypto = require('crypto');
-      let docBuffer;
-      const d = String(document).trim();
-      if (/^[0-9a-fA-F]+$/.test(d) && d.length % 2 === 0) {
-        docBuffer = Buffer.from(d, 'hex');
-      } else {
-        try {
-          docBuffer = Buffer.from(d, 'base64');
-        } catch {
-          return res.status(400).json({
-            success: false,
-            error: { code: 'INVALID_DOCUMENT', message: 'document must be hex or base64 encoded bytes' },
-          });
-        }
-      }
-      providedHashHex = crypto.createHash('sha256').update(docBuffer).digest('hex');
-    }
-
-    const storedHash = transaction.memoHash.toLowerCase();
-    const verified = storedHash === providedHashHex;
 
     return res.json({
       success: true,
-      data: {
-        verified,
-        donationId: transaction.id,
-        memoHash: storedHash,
-        providedHash: providedHashHex,
-      },
+      data: { donationId, cid, gateway: `${GATEWAY_URL}/${cid}`, pinned },
     });
   } catch (error) {
     next(error);

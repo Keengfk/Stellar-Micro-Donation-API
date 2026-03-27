@@ -1032,6 +1032,56 @@ class StellarService extends StellarServiceInterface {
     }, 'burnAsset');
   }
 
+  /**
+   * Clawback a custom Stellar asset from a holder back to the issuer.
+   *
+   * Requires the asset to have CLAWBACK_ENABLED flag set on the issuer account.
+   * Only the asset issuer can perform clawback operations.
+   *
+   * @param {string} issuerSecret  - Secret key of the asset issuer
+   * @param {string} from          - Public key of the account to clawback from
+   * @param {string} assetCode     - Asset code to clawback
+   * @param {string} amount        - Amount to clawback
+   * @returns {Promise<{hash: string, ledger: number, assetCode: string, from: string, amount: string}>}
+   */
+  async clawback(issuerSecret, from, assetCode, amount) {
+    return StellarErrorHandler.wrap(async () => {
+      const { ValidationError } = require('../utils/errors');
+
+      if (!assetCode || !/^[A-Za-z0-9]{1,12}$/.test(assetCode)) {
+        throw new ValidationError('Asset code must be 1-12 alphanumeric characters');
+      }
+      if (!from) throw new ValidationError('from (holder public key) is required');
+      if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+        throw new ValidationError('amount must be a positive number');
+      }
+
+      const issuerKeypair = StellarSdk.Keypair.fromSecret(issuerSecret);
+      const issuerPublic = issuerKeypair.publicKey();
+      const asset = new StellarSdk.Asset(assetCode, issuerPublic);
+
+      const issuerAccount = await this._executeWithRetry(() =>
+        this.server.loadAccount(issuerPublic)
+      );
+
+      const transaction = new StellarSdk.TransactionBuilder(issuerAccount, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(StellarSdk.Operation.clawback({ asset, from, amount: amount.toString() }))
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(issuerKeypair);
+      const result = await this._submitTransactionWithNetworkSafety(transaction);
+
+      log.info('STELLAR_SERVICE', 'Asset clawback executed', {
+        assetCode, issuerPublic, from, amount, hash: result.hash,
+      });
+
+      return { hash: result.hash, ledger: result.ledger, assetCode, from, amount };
+    }, 'clawback');
+  }
 
   /**
    * Get the home domain for a Stellar account.
@@ -1378,116 +1428,50 @@ class StellarService extends StellarServiceInterface {
   }
 
   /**
-   * Mint a unique NFT donation certificate on Stellar.
+   * Set account options on the Stellar network.
    *
-   * Issues exactly 1 unit of a custom asset to the recipient, then locks the
-   * issuer account (master weight = 0) so no additional supply can ever be
-   * created, enforcing a hard supply cap of 1.
+   * Supports all Stellar setOptions fields: homeDomain, inflationDest,
+   * masterWeight, lowThreshold, medThreshold, highThreshold, signer, setFlags,
+   * clearFlags.
    *
-   * @param {Object} params
-   * @param {string} params.issuerSecret        - Secret key of the (fresh) issuer account
-   * @param {string} params.recipientPublicKey  - Stellar public key of the certificate recipient
-   * @param {string} params.donationId          - Donation ID used to derive the asset code
-   * @param {string} [params.amount]            - Donation amount (informational, not used on-chain)
-   * @param {string} [params.campaignId]        - Campaign ID (informational)
-   * @param {string} [params.donatedAt]         - ISO timestamp of the donation (informational)
-   * @returns {Promise<{assetCode: string, issuer: string, txHash: string, ledger: number}>}
-   * @throws {ValidationError}    If inputs are invalid
-   * @throws {BusinessLogicError} If the Stellar operation fails
+   * AUTH_IMMUTABLE (flag 8) cannot be cleared once set — this is enforced
+   * on-chain by the network; we validate it here for a clear error message.
+   *
+   * @param {string} secret  - Account secret key
+   * @param {object} options - setOptions fields (see Stellar SDK docs)
+   * @returns {Promise<{hash: string, ledger: number}>}
    */
-  async mintCertificateNFT({ issuerSecret, recipientPublicKey, donationId }) {
+  async setOptions(secret, options = {}) {
     return StellarErrorHandler.wrap(async () => {
-      const { ValidationError } = require('../utils/errors');
-
-      if (!issuerSecret) throw new ValidationError('issuerSecret is required');
-      if (!recipientPublicKey) throw new ValidationError('recipientPublicKey is required');
-      if (!donationId) throw new ValidationError('donationId is required');
-
-      // Derive asset code: "CERT" + first 8 chars of donationId (uppercase alphanumeric), max 12 chars
-      const suffix = donationId.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8);
-      const assetCode = `CERT${suffix}`.slice(0, 12);
-
-      if (!/^[A-Za-z0-9]{1,12}$/.test(assetCode)) {
-        throw new ValidationError(`Derived asset code "${assetCode}" is invalid`);
-      }
-
-      const issuerKeypair = StellarSdk.Keypair.fromSecret(issuerSecret);
-      const issuerPublic = issuerKeypair.publicKey();
-
-      if (issuerPublic === recipientPublicKey) {
-        throw new ValidationError('Issuer and recipient cannot be the same account');
-      }
-
-      const asset = new StellarSdk.Asset(assetCode, issuerPublic);
-
-      const issuerAccount = await this._executeWithRetry(
-        () => this.server.loadAccount(issuerPublic),
-        'loadIssuerForNFT'
+      const keypair = StellarSdk.Keypair.fromSecret(secret);
+      const account = await this._executeWithRetry(
+        () => this.server.loadAccount(keypair.publicKey()),
+        'loadAccountForSetOptions'
       );
 
-      // Build a single transaction that:
-      //   1. Pays exactly 1 unit of the NFT asset to the recipient
-      //   2. Sets issuer master weight to 0 (locks the account — no more issuance possible)
-      const transaction = new StellarSdk.TransactionBuilder(issuerAccount, {
+      // Validate: AUTH_IMMUTABLE (flag 8) cannot be cleared
+      const AUTH_IMMUTABLE = StellarSdk.AuthImmutableFlag;
+      if (options.clearFlags !== undefined) {
+        const flags = Number(options.clearFlags);
+        // eslint-disable-next-line no-bitwise
+        if ((flags & AUTH_IMMUTABLE) !== 0) {
+          const { ValidationError: VE } = require('../utils/errors');
+          throw new VE('AUTH_IMMUTABLE flag cannot be cleared once set');
+        }
+      }
+
+      const transaction = new StellarSdk.TransactionBuilder(account, {
         fee: this.baseFee,
         networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(StellarSdk.Operation.payment({
-          destination: recipientPublicKey,
-          asset,
-          amount: '1',
-        }))
-        .addOperation(StellarSdk.Operation.setOptions({
-          masterWeight: 0,
-        }))
+        .addOperation(StellarSdk.Operation.setOptions(options))
         .setTimeout(30)
         .build();
 
-      transaction.sign(issuerKeypair);
+      transaction.sign(keypair);
       const result = await this._submitTransactionWithNetworkSafety(transaction);
-
-      log.info('STELLAR_SERVICE', 'NFT certificate minted', {
-        assetCode,
-        issuerPublic,
-        recipientPublicKey,
-        donationId,
-        txHash: result.hash,
-      });
-
-      return {
-        assetCode,
-        issuer: issuerPublic,
-        txHash: result.hash,
-        ledger: result.ledger,
-      };
-    }, 'mintCertificateNFT');
-  }
-
-  /**
-   * Retrieve all donation certificate NFTs held by a wallet.
-   *
-   * Queries Horizon for non-native balances on the account and filters for
-   * assets whose code starts with "CERT".
-   *
-   * @param {string} publicKey - Stellar public key of the wallet to query
-   * @returns {Promise<Array<{assetCode: string, issuer: string, balance: string}>>}
-   * @throws {BusinessLogicError} If the Horizon query fails
-   */
-  async getCertificatesForWallet(publicKey) {
-    return StellarErrorHandler.wrap(async () => {
-      const account = await this._executeWithRetry(
-        () => this.server.loadAccount(publicKey),
-        'loadAccountForCertificates'
-      );
-
-      return account.balances
-        .filter(b => b.asset_type !== 'native' && b.asset_code && b.asset_code.startsWith('CERT'))
-        .map(b => ({
-          assetCode: b.asset_code,
-          issuer: b.asset_issuer,
-          balance: b.balance,
-        }));
-    }, 'getCertificatesForWallet');
+      return { hash: result.hash, ledger: result.ledger };
+    }, 'setOptions');
   }
 
   /**

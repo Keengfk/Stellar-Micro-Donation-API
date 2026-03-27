@@ -671,6 +671,8 @@ router.delete('/:id/data/:key',
     }
   }
 );
+
+/**
  * POST /wallets/:id/merge
  * Merge a wallet into a destination account.
  *
@@ -780,103 +782,57 @@ router.post('/:id/merge', checkPermission(PERMISSIONS.WALLETS_DELETE), async (re
   }
 });
 
+// ─── Account Set Options ──────────────────────────────────────────────────────
+
+const walletOptionsSchema = validateSchema({
+  params: { fields: { id: { type: 'integerString', required: true } } },
+  body: {
+    fields: {
+      secret:         { type: 'string', required: true },
+      homeDomain:     { type: 'string', required: false, nullable: true, maxLength: 32 },
+      inflationDest:  { type: 'string', required: false, nullable: true },
+      masterWeight:   { type: 'integer', required: false, min: 0, max: 255 },
+      lowThreshold:   { type: 'integer', required: false, min: 0, max: 255 },
+      medThreshold:   { type: 'integer', required: false, min: 0, max: 255 },
+      highThreshold:  { type: 'integer', required: false, min: 0, max: 255 },
+      setFlags:       { type: 'integer', required: false, min: 0 },
+      clearFlags:     { type: 'integer', required: false, min: 0 },
+    },
+  },
+});
+
 /**
- * GET /wallets/:id/certificates
- * Return all donation certificate NFTs held by a wallet.
- * Queries Horizon (or mock) for CERT-prefixed assets on the wallet's Stellar account.
+ * PATCH /wallets/:id/options
+ * Set Stellar account options for a custodial wallet.
+ * Validates that AUTH_IMMUTABLE cannot be cleared.
+ * Logs changes to the audit trail.
  */
-router.get('/:id/certificates', checkPermission(PERMISSIONS.WALLETS_READ), walletIdSchema, async (req, res, next) => {
+router.patch('/:id/options', checkPermission(PERMISSIONS.WALLETS_UPDATE), walletOptionsSchema, async (req, res, next) => {
   try {
-    const wallet = await walletService.getWalletById(req.params.id);
-    if (!wallet) {
-      return res.status(404).json({ success: false, error: 'Wallet not found' });
-    }
+    const walletId = parseInt(req.params.id, 10);
+    const { secret, ...options } = req.body;
 
-    const stellarSvc = getStellarService();
-    const certificates = await stellarSvc.getCertificatesForWallet(wallet.address || wallet.publicKey);
+    const wallet = await Database.get('SELECT * FROM users WHERE id = ?', [walletId]);
+    if (!wallet) throw new NotFoundError(`Wallet ${walletId} not found`);
 
-    res.json({
-      success: true,
-      data: certificates,
-      count: certificates.length,
+    const stellar = getStellarService();
+    const result = await stellar.setOptions(secret, options);
+
+    await AuditLogService.log({
+      category: AuditLogService.CATEGORY.WALLET_OPERATION,
+      action: 'WALLET_OPTIONS_SET',
+      severity: AuditLogService.SEVERITY.MEDIUM,
+      result: 'SUCCESS',
+      requestId: req.id,
+      ipAddress: req.ip,
+      resource: `/wallets/${walletId}/options`,
+      details: { walletId, options: Object.keys(options), transactionHash: result.hash },
     });
+
+    return res.json({ success: true, data: { walletId, transactionHash: result.hash, ledger: result.ledger } });
   } catch (error) {
     next(error);
   }
 });
- * POST /wallets/bulk-import
- * Import multiple existing Stellar wallets in a single request.
- * Middleware chain: requireApiKey → bulkImportRateLimiter → Content-Type check →
- *   batch size validation → checkPermission(WALLETS_CREATE)
- */
-router.post(
-  '/bulk-import',
-  requireApiKey,
-  bulkImportRateLimiter,
-  (req, res, next) => {
-    const contentType = req.headers['content-type'] || '';
-    if (!contentType.includes('application/json')) {
-      return res.status(415).json({
-        success: false,
-        error: {
-          code: 'UNSUPPORTED_MEDIA_TYPE',
-          message: 'Content-Type must be application/json'
-        }
-      });
-    }
-    next();
-  },
-  (req, res, next) => {
-    const wallets = req.body && req.body.wallets;
-    if (!Array.isArray(wallets) || wallets.length === 0) {
-      return res.status(422).json({
-        success: false,
-        error: {
-          code: 'INVALID_BATCH',
-          message: 'wallets array must not be empty'
-        }
-      });
-    }
-    if (wallets.length > 100) {
-      return res.status(422).json({
-        success: false,
-        error: {
-          code: 'BATCH_TOO_LARGE',
-          message: `Batch size limit exceeded: maximum 100 wallets per request, got ${wallets.length}`
-        }
-      });
-    }
-    next();
-  },
-  checkPermission(PERMISSIONS.WALLETS_CREATE),
-  async (req, res, next) => {
-    try {
-      const { wallets } = req.body;
-      const bulkImportService = new BulkWalletImportService(walletService, stellarService);
-      const { results, summary } = await bulkImportService.importBatch(wallets, req.apiKey.id);
-
-      await AuditLogService.log({
-        category: AuditLogService.CATEGORY.WALLET_OPERATION,
-        action: AuditLogService.ACTION.BULK_WALLET_IMPORT,
-        severity: AuditLogService.SEVERITY.MEDIUM,
-        result: 'SUCCESS',
-        userId: req.apiKey.id,
-        requestId: req.id,
-        ipAddress: req.ip,
-        resource: '/wallets/bulk-import',
-        details: {
-          batchSize: wallets.length,
-          succeeded: summary.succeeded,
-          duplicates: summary.duplicates,
-          failed: summary.failed
-        }
-      });
-
-      return res.status(200).json({ results, summary });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
 
 module.exports = router;
